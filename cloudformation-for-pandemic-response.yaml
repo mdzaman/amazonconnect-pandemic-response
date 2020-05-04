@@ -1,0 +1,276 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Create resources for automated call connect solution.
+Parameters:
+  ConnectInstanceId:
+    Description: Connect Instance Id
+    Type: String
+  ConnectContactFlowId:
+    Description: Connect Contact Flow Id
+    Type: String
+  PhoneNoFilename:
+    Description: >-
+      Name of the file which contains the list of phone numbers. (must end with
+      .csv)
+    Type: String
+  SourcePhoneNo:
+    Description: >-
+      Phone Number used as source for calls. Must include country and area code
+      and start with +(country code) followed by phone number without any special characters. (e.g +121233344)
+    Type: String
+Resources:
+  CallS3Bucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Retain
+
+  LambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt
+        - AutoCallLambdaFunction
+        - Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Sub 'arn:aws:s3:::${CallS3Bucket}'
+
+  CallDBTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: phoneNumber
+          AttributeType: S
+      KeySchema:
+        - AttributeName: phoneNumber
+          KeyType: HASH
+
+  CaptureLanguageLambdaFunction:
+    DependsOn: CallDBTable
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Description: Capture language lambda function
+      Handler: index.handler
+      MemorySize: 1024
+      Role: !GetAtt
+        - CallLambdaFunctionRole
+        - Arn
+      Runtime: nodejs12.x
+      Timeout: 60
+      Code:
+        ZipFile: !Sub |
+          var AWS = require("aws-sdk");
+          var docClient = new AWS.DynamoDB.DocumentClient();
+
+
+          exports.handler = (event, context, callback) => {
+            console.log(event);
+            var CallerID = event.Details.ContactData.CustomerEndpoint.Address;
+            var language= event.Details.Parameters.languagechoice;
+            console.log(language);
+
+            var paramsPut = {
+              TableName: '${CallDBTable}',
+              Item:{
+                  "phoneNumber": CallerID,
+                  "languageChoice": language
+              }
+            };
+            docClient.put(paramsPut, function(err, data) {
+              if (err) {
+                console.log(err);
+                callback(null, buildResponse(false));
+              }
+              else {
+                console.log("DynamoDB record created:" + paramsPut);
+                callback(null, buildResponse(true))
+                      }
+
+            });
+          };
+
+          function buildResponse(isSuccess) {
+            if (isSuccess) {
+              return {
+                lambdaResult: "Success"
+              };
+            }
+            else {
+              console.log("Lambda returned error to Connect");
+              return { lambdaResult: "Error" };
+            }
+          }
+  PlayMessageLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Description: Play message lambda function
+      Handler: index.handler
+      MemorySize: 1024
+      Role: !GetAtt
+        - CallLambdaFunctionRole
+        - Arn
+      Runtime: nodejs12.x
+      Timeout: 60
+      Code:
+        ZipFile: !Sub |
+          var AWS = require("aws-sdk");
+          var docClient = new AWS.DynamoDB.DocumentClient();
+
+          exports.handler = (event, context, callback) => {
+              var phoneNumber = event.Details.ContactData.CustomerEndpoint.Address;
+              var paramsQuery = {
+                          TableName: '${CallDBTable}',
+                            KeyConditionExpression: "phoneNumber = :varNumber",
+
+                            ExpressionAttributeValues: {
+                                ":varNumber": phoneNumber
+                            }
+                      };
+
+              docClient.query(paramsQuery, function(err, data) {
+                    if (err) {
+                        console.log(err);
+                        context.fail(buildResponse(false));
+                    }
+                  else {
+                        console.log("DynamoDB Query Results:" + JSON.stringify(data));
+
+                        if (data.Items.length === 1) {
+                          console.log(data.Items[0].languageChoice);
+                          var languagechoice = data.Items[0].languageChoice;
+                          callback(null, buildResponse(true, languagechoice));
+                        }
+                      else {
+                          console.log("PhoneNumber not found");
+                          callback(null, buildResponse(false));
+                        }
+                    }
+              });
+          };
+
+          function buildResponse(isSuccess, languageChoice) {
+              if (isSuccess) {
+                    return {
+                        lambdaResult: "Success",
+                      languageChoice: languageChoice
+                  };
+              }
+              else {
+                    return { lambdaResult: "Error" };
+              }
+          }
+  CallLambdaFunctionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/AmazonConnectFullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess'
+        - 'arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess'
+      Policies:
+        - PolicyName: DescribeDirectoryServices
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:*'
+                Resource: '*'
+  AutoCallLambdaFunction:
+    DependsOn: CallS3Bucket
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Description: Call handler lambda function
+      Handler: index.lambda_handler
+      MemorySize: 1024
+      Role: !GetAtt
+        - CallLambdaFunctionRole
+        - Arn
+      Runtime: python3.6
+      Timeout: 60
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import sys
+          import time
+
+          def lambda_handler(event, context):
+
+              s3 = boto3.client('s3')
+
+              try:
+                print ("Collect input values")
+                connect_instance_id = '${ConnectInstanceId}'
+                connect_contact_flow_id = '${ConnectContactFlowId}'
+                s3_bucket_name = '${CallS3Bucket}'
+                phone_no_filename = '${PhoneNoFilename}'
+                source_phone_no = '${SourcePhoneNo}'
+                print (connect_instance_id, connect_contact_flow_id, s3_bucket_name, phone_no_filename, source_phone_no)
+
+                print ("Attempting to establish session with AWS Connect service .. ")
+                connect_client = boto3.client('connect')
+              except Exception as e:
+                print ("ERR: Problem getting the connection to AWS Connect.")
+                print ("Aborted")
+                print (str(e))
+                sys.exit(1)
+
+              print ("INFO: Reading the input file from S3.")
+              data = s3.get_object(Bucket=s3_bucket_name, Key=phone_no_filename)
+              contents = data['Body'].read().decode('utf-8')
+              print ("INFO: Parsing the input file for the list of phone numbers ..")
+              phone_numbers = list(map(lambda x: x.split(",")[0], contents.strip().split("\n")))
+              print ("INFO: Got the list of phone numbers ..")
+
+              for number in phone_numbers:
+                  print ('Processing {}'.format(number))
+
+                  response = connect_client.start_outbound_voice_contact(  DestinationPhoneNumber=number,
+                                                                  ContactFlowId=connect_contact_flow_id,
+                                                                  InstanceId=connect_instance_id,
+                                                                  # ClientToken='string',
+                                                                  SourcePhoneNumber=source_phone_no,
+                                                                  #QueueId='string',
+                                                                  #Attributes={
+                                                                    # 'string': 'string'
+                                                                  # }
+
+                                                                )
+                  print(response)
+                  #time.sleep(1)
+
+                  # Verify that response was success
+          '''
+              return {
+                  'status_code' : 200,
+                    'processed': phone_numbers
+
+              }
+
+          '''
+Outputs:
+  S3Bucket:
+    Description: S3Bucket
+    Value: !Ref CallS3Bucket
+  DynamoDBTable:
+    Description: DynamoDbTable
+    Value: !Ref CallDBTable
+  LAMBDAWRITE:
+    Description: LAMBDA FUNCTION TO CAPTURE AND UPDATE THE LANGUAGE OF THE USER
+    Value: !Ref CaptureLanguageLambdaFunction
+  LAMBDAREAD:
+    Description: LAMBDA FUNCTION TO PLAY THE MEESGAE IN THE PREFFERED LANGAUGE FETCHED FROM THE DYNAMOTABLE
+    Value: !Ref PlayMessageLambdaFunction
+  LAMBDAOUTBOUND:
+    Description: LAMBDA FUNCTION TO MAKE OUTBOUND CALLS
+    Value: !Ref AutoCallLambdaFunction
